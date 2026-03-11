@@ -1,464 +1,393 @@
 #!/bin/bash
 
-# ============================================================
-#  ELK Stack Installer: Elasticsearch + Kibana - PRODUCTION
-#  Ubuntu 20.04 / 22.04 / 24.04
-#  Version: 8.x | SSL + Auth + Security ENABLED
-# ============================================================
+#####################################
+# ELK Stack Installer - Final Version
+# Ubuntu 24.04 LTS
+# With Elasticsearch API proxy
+#####################################
 
 set -e
 
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
-log()    { echo -e "${GREEN}[✔] $1${NC}"; }
-warn()   { echo -e "${YELLOW}[!] $1${NC}"; }
-error()  { echo -e "${RED}[✘] $1${NC}"; exit 1; }
-header() { echo -e "\n${CYAN}${BOLD}========== $1 ==========${NC}\n"; }
+log() { echo -e "${BLUE}[$(date +'%H:%M:%S')]${NC} $1"; }
+success() { echo -e "${GREEN}✓${NC} $1"; }
+error() { echo -e "${RED}✗${NC} $1"; exit 1; }
+warning() { echo -e "${YELLOW}⚠${NC} $1"; }
 
-# ============================================================
-# KIỂM TRA ROOT
-# ============================================================
-if [ "$EUID" -ne 0 ]; then
-  error "Vui lòng chạy với quyền root: sudo bash $0"
-fi
+# Config
+DOMAIN="search.isures.com"
+ES_VERSION="8.x"
 
-# ============================================================
-# CẤU HÌNH — chỉnh tại đây trước khi chạy
-# ============================================================
-ES_PORT=9200
-KIBANA_PORT=5601
-ES_HEAP="1g"          # 50% RAM, tối đa 31g. Ví dụ: 4GB RAM → 2g
+# Root check
+[ "$EUID" -ne 0 ] && error "Run as root"
 
-# RAM detect tự động (có thể override ở trên)
-TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
-AUTO_HEAP=$(( TOTAL_RAM_MB / 2 ))m
-if [ "$ES_HEAP" = "1g" ] && [ "$TOTAL_RAM_MB" -gt 2048 ]; then
-  ES_HEAP="${AUTO_HEAP}"
-  warn "Tự động đặt JVM heap: ${ES_HEAP} (50% RAM)"
-fi
+clear
+echo "╔════════════════════════════════════════╗"
+echo "║   ELK Stack Installer - Ubuntu 24.04  ║"
+echo "╚════════════════════════════════════════╝"
+echo ""
 
-# ============================================================
-# BƯỚC 1: Cập nhật hệ thống
-# ============================================================
-header "Bước 1: Cập nhật hệ thống"
-apt-get update -y
-apt-get install -y curl wget gnupg apt-transport-https \
-  software-properties-common openssl pwgen ufw
-log "Cập nhật xong"
+#####################################
+# 1. SWAP
+#####################################
+echo "━━━ [1/8] SWAP Setup ━━━"
+RAM_MB=$(free -m | awk '/Mem:/ {print $2}')
+SWAP_MB=$(free -m | awk '/Swap:/ {print $2}')
+log "RAM: ${RAM_MB}MB, SWAP: ${SWAP_MB}MB"
 
-# ============================================================
-# BƯỚC 2: Java
-# ============================================================
-header "Bước 2: Kiểm tra Java"
-if ! java -version &>/dev/null; then
-  apt-get install -y openjdk-17-jdk
-  log "Đã cài OpenJDK 17"
+if [ $SWAP_MB -eq 0 ]; then
+    SWAP_SIZE=$((RAM_MB * 2))
+    [ $SWAP_SIZE -gt 4096 ] && SWAP_SIZE=4096
+    
+    log "Creating ${SWAP_SIZE}MB swap..."
+    dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE status=none
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null 2>&1
+    swapon /swapfile
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    
+    sysctl -w vm.swappiness=10 >/dev/null
+    echo "vm.swappiness=10" >> /etc/sysctl.conf
+    
+    success "SWAP: ${SWAP_SIZE}MB"
 else
-  log "Java đã có: $(java -version 2>&1 | head -1)"
+    success "SWAP exists: ${SWAP_MB}MB"
 fi
+echo ""
 
-# ============================================================
-# BƯỚC 3: Elastic repo
-# ============================================================
-header "Bước 3: Thêm Elastic repository"
-wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | \
-  gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
+#####################################
+# 2. SSL CERTIFICATES
+#####################################
+echo "━━━ [2/8] SSL Certificates ━━━"
+mkdir -p /etc/ssl/cloudflare
+CERT_FILE="/etc/ssl/cloudflare/fullchain.pem"
+KEY_FILE="/etc/ssl/cloudflare/privkey.pem"
 
-echo "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] \
-https://artifacts.elastic.co/packages/8.x/apt stable main" \
-  > /etc/apt/sources.list.d/elastic-8.x.list
+if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+    success "SSL certificates exist"
+else
+    log "Paste Cloudflare Origin Certificate (Ctrl+D when done):"
+    cat > "$CERT_FILE"
+    log "Paste Private Key (Ctrl+D when done):"
+    cat > "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
+    chmod 644 "$CERT_FILE"
+    success "SSL saved"
+fi
+echo ""
 
-apt-get update -y
-log "Elastic repo OK"
+#####################################
+# 3. SYSTEM PREP
+#####################################
+echo "━━━ [3/8] System Preparation ━━━"
+log "Installing packages..."
+apt-get update -qq
+apt-get install -y -qq apt-transport-https ca-certificates curl gnupg
 
-# ============================================================
-# BƯỚC 4: Cài Elasticsearch
-# ============================================================
-header "Bước 4: Cài Elasticsearch"
-apt-get install -y elasticsearch
-log "Cài xong"
+sysctl -w vm.max_map_count=262144 >/dev/null
+grep -q "vm.max_map_count" /etc/sysctl.conf || echo "vm.max_map_count=262144" >> /etc/sysctl.conf
 
-# ============================================================
-# BƯỚC 5: Tạo SSL certificates
-# ============================================================
-header "Bước 5: Tạo SSL certificates (tự ký)"
-CERT_DIR="/etc/elasticsearch/certs"
-mkdir -p "$CERT_DIR"
+success "System ready"
+echo ""
 
-# Tạo CA
-/usr/share/elasticsearch/bin/elasticsearch-certutil ca \
-  --out "$CERT_DIR/elastic-stack-ca.p12" \
-  --pass "" --silent
+#####################################
+# 4. ELASTICSEARCH
+#####################################
+echo "━━━ [4/8] Elasticsearch ━━━"
+log "Adding repository..."
+curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | \
+    gpg --dearmor -o /usr/share/keyrings/elastic.gpg
 
-# Tạo cert cho Elasticsearch
-/usr/share/elasticsearch/bin/elasticsearch-certutil cert \
-  --ca "$CERT_DIR/elastic-stack-ca.p12" \
-  --ca-pass "" \
-  --out "$CERT_DIR/elastic-certificates.p12" \
-  --pass "" --silent
+echo "deb [signed-by=/usr/share/keyrings/elastic.gpg] https://artifacts.elastic.co/packages/${ES_VERSION}/apt stable main" \
+    > /etc/apt/sources.list.d/elastic.list
 
-# Xuất PEM cho Kibana
-/usr/share/elasticsearch/bin/elasticsearch-certutil cert \
-  --ca "$CERT_DIR/elastic-stack-ca.p12" \
-  --ca-pass "" \
-  --pem \
-  --out "$CERT_DIR/kibana-certs.zip" \
-  --silent
+apt-get update -qq
+log "Installing Elasticsearch..."
+apt-get install -y -qq elasticsearch
 
-cd "$CERT_DIR"
-unzip -o kibana-certs.zip -d kibana-pem > /dev/null
+mkdir -p /var/lib/elasticsearch /var/log/elasticsearch
+chown -R elasticsearch:elasticsearch /var/lib/elasticsearch /var/log/elasticsearch
 
-# Xuất CA PEM
-openssl pkcs12 -in "$CERT_DIR/elastic-stack-ca.p12" \
-  -nokeys -out "$CERT_DIR/ca.crt" \
-  -passin pass: 2>/dev/null
+success "Elasticsearch installed"
+echo ""
 
-chown -R root:elasticsearch "$CERT_DIR"
-chmod -R 750 "$CERT_DIR"
-log "Tạo SSL xong"
+#####################################
+# 5. ELASTICSEARCH CONFIG
+#####################################
+echo "━━━ [5/8] Configuring Elasticsearch ━━━"
 
-# ============================================================
-# BƯỚC 6: Cấu hình Elasticsearch (Production)
-# ============================================================
-header "Bước 6: Cấu hình Elasticsearch"
+HEAP_MB=$((RAM_MB * 40 / 100))
+[ $HEAP_MB -lt 256 ] && HEAP_MB=256
+[ $HEAP_MB -gt 2048 ] && HEAP_MB=2048
+log "Heap: ${HEAP_MB}MB"
 
-ES_CONFIG="/etc/elasticsearch/elasticsearch.yml"
-cp "$ES_CONFIG" "${ES_CONFIG}.bak"
+mkdir -p /etc/elasticsearch/jvm.options.d
+cat > /etc/elasticsearch/jvm.options.d/heap.options <<EOF
+-Xms${HEAP_MB}m
+-Xmx${HEAP_MB}m
+EOF
 
-cat > "$ES_CONFIG" <<EOF
-# ===================== Elasticsearch - PRODUCTION =====================
-
-cluster.name: elk-production
+cat > /etc/elasticsearch/elasticsearch.yml <<'EOF'
+cluster.name: elk-cluster
 node.name: node-1
-
-network.host: 0.0.0.0
-http.port: ${ES_PORT}
-
-discovery.type: single-node
-
 path.data: /var/lib/elasticsearch
 path.logs: /var/log/elasticsearch
+network.host: 127.0.0.1
+http.port: 9200
+discovery.type: single-node
 
-# ---- SECURITY ----
+# Security enabled
 xpack.security.enabled: true
 xpack.security.enrollment.enabled: true
-
-# HTTP (clients)
-xpack.security.http.ssl.enabled: true
-xpack.security.http.ssl.keystore.path: certs/elastic-certificates.p12
-xpack.security.http.ssl.truststore.path: certs/elastic-certificates.p12
-
-# Transport (node-to-node)
-xpack.security.transport.ssl.enabled: true
-xpack.security.transport.ssl.verification_mode: certificate
-xpack.security.transport.ssl.keystore.path: certs/elastic-certificates.p12
-xpack.security.transport.ssl.truststore.path: certs/elastic-certificates.p12
-
-# ---- MONITORING ----
-xpack.monitoring.collection.enabled: true
-
-# ---- PERFORMANCE ----
-indices.memory.index_buffer_size: 20%
-thread_pool.write.queue_size: 1000
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false
 EOF
 
-# JVM Heap
-cat > /etc/elasticsearch/jvm.options.d/heap.options <<EOF
--Xms${ES_HEAP}
--Xmx${ES_HEAP}
-EOF
+chown -R elasticsearch:elasticsearch /etc/elasticsearch
 
-# Giới hạn memory swap
-cat >> /etc/elasticsearch/jvm.options.d/heap.options <<EOF
--XX:+AlwaysPreTouch
-EOF
+# Clean old keystore
+if [ -f /etc/elasticsearch/elasticsearch.keystore ]; then
+    /usr/share/elasticsearch/bin/elasticsearch-keystore remove \
+        xpack.security.transport.ssl.keystore.secure_password 2>/dev/null || true
+    /usr/share/elasticsearch/bin/elasticsearch-keystore remove \
+        xpack.security.transport.ssl.truststore.secure_password 2>/dev/null || true
+fi
 
-# Tắt swap cho ES
-echo "bootstrap.memory_lock: true" >> "$ES_CONFIG"
-
-mkdir -p /etc/systemd/system/elasticsearch.service.d
-cat > /etc/systemd/system/elasticsearch.service.d/override.conf <<EOF
-[Service]
-LimitMEMLOCK=infinity
-LimitNOFILE=65535
-LimitNPROC=4096
-EOF
-
-# Kernel tuning cho production
-cat >> /etc/sysctl.conf <<EOF
-
-# Elasticsearch production tuning
-vm.max_map_count=262144
-vm.swappiness=1
-net.core.somaxconn=65535
-EOF
-sysctl -p > /dev/null 2>&1
-
-log "Cấu hình Elasticsearch xong"
-
-# ============================================================
-# BƯỚC 7: Khởi động Elasticsearch & lấy mật khẩu
-# ============================================================
-header "Bước 7: Khởi động Elasticsearch"
+log "Starting Elasticsearch..."
 systemctl daemon-reload
-systemctl enable elasticsearch
-systemctl start elasticsearch
+systemctl enable elasticsearch >/dev/null 2>&1
+systemctl restart elasticsearch
 
-log "Đang chờ Elasticsearch sẵn sàng (tối đa 60s)..."
-for i in {1..20}; do
-  if curl -sk "https://localhost:${ES_PORT}" -u "elastic:changeme" > /dev/null 2>&1 || \
-     curl -sk "https://localhost:${ES_PORT}" > /dev/null 2>&1; then
-    break
-  fi
-  sleep 3
-  echo -n "."
+log "Waiting..."
+for i in {1..60}; do
+    if curl -s http://127.0.0.1:9200 >/dev/null 2>&1; then
+        success "Elasticsearch running"
+        break
+    fi
+    sleep 2
 done
 echo ""
 
-# Reset mật khẩu elastic user
-log "Đặt mật khẩu cho user 'elastic'..."
-ES_PASSWORD=$(pwgen -s 20 1)
+#####################################
+# 6. GENERATE PASSWORDS
+#####################################
+echo "━━━ [6/8] Security Setup ━━━"
+log "Generating passwords..."
 
-/usr/share/elasticsearch/bin/elasticsearch-reset-password \
-  -u elastic -i --batch \
-  --url "https://localhost:${ES_PORT}" \
-  <<< "$ES_PASSWORD" 2>/dev/null || \
-/usr/share/elasticsearch/bin/elasticsearch-reset-password \
-  -u elastic --auto --batch \
-  --url "https://localhost:${ES_PORT}" 2>/dev/null | \
-  grep -oP '(?<=New value: ).*' > /tmp/es_pass_auto.txt && \
-  ES_PASSWORD=$(cat /tmp/es_pass_auto.txt) || true
+ELASTIC_PASS=$(/usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -b 2>/dev/null | grep "New value:" | awk '{print $3}')
+KIBANA_PASS=$(/usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana_system -b 2>/dev/null | grep "New value:" | awk '{print $3}')
 
-# Nếu auto-reset thất bại, dùng API
-if [ -z "$ES_PASSWORD" ]; then
-  ES_PASSWORD=$(pwgen -s 20 1)
-  curl -sk -X POST "https://localhost:${ES_PORT}/_security/user/elastic/_password" \
-    --cacert "$CERT_DIR/ca.crt" \
-    -H "Content-Type: application/json" \
-    -d "{\"password\":\"${ES_PASSWORD}\"}" || true
-fi
+[ -z "$ELASTIC_PASS" ] && error "Password generation failed"
 
-log "Elasticsearch đang chạy ✓"
+success "Passwords generated"
+echo ""
 
-# ============================================================
-# BƯỚC 8: Cài Kibana
-# ============================================================
-header "Bước 8: Cài Kibana"
-apt-get install -y kibana
-log "Cài Kibana xong"
+#####################################
+# 7. KIBANA
+#####################################
+echo "━━━ [7/8] Kibana ━━━"
+log "Installing Kibana..."
+apt-get install -y -qq kibana
 
-# ============================================================
-# BƯỚC 9: Tạo Kibana service token
-# ============================================================
-header "Bước 9: Tạo Kibana service token"
-
-KIBANA_TOKEN=$(/usr/share/elasticsearch/bin/elasticsearch-service-tokens \
-  create elastic/kibana kibana-prod 2>/dev/null | grep -oP '(?<=SERVICE_TOKEN elastic/kibana/kibana-prod = ).*' || true)
-
-if [ -z "$KIBANA_TOKEN" ]; then
-  KIBANA_TOKEN=$(curl -sk -X POST \
-    "https://localhost:${ES_PORT}/_security/service/elastic/kibana/credential/token/kibana-token" \
-    -u "elastic:${ES_PASSWORD}" \
-    --cacert "$CERT_DIR/ca.crt" | \
-    python3 -c "import sys,json; print(json.load(sys.stdin)['token']['value'])" 2>/dev/null || echo "")
-fi
-
-log "Service token tạo xong"
-
-# ============================================================
-# BƯỚC 10: Cấu hình Kibana (Production)
-# ============================================================
-header "Bước 10: Cấu hình Kibana"
-
-# Copy cert cho Kibana
-KIBANA_CERT_DIR="/etc/kibana/certs"
-mkdir -p "$KIBANA_CERT_DIR"
-cp "$CERT_DIR/kibana-pem/instance/instance.crt" "$KIBANA_CERT_DIR/kibana.crt"
-cp "$CERT_DIR/kibana-pem/instance/instance.key" "$KIBANA_CERT_DIR/kibana.key"
-cp "$CERT_DIR/ca.crt" "$KIBANA_CERT_DIR/ca.crt"
-chown -R root:kibana "$KIBANA_CERT_DIR"
-chmod -R 750 "$KIBANA_CERT_DIR"
-
-KIBANA_CONFIG="/etc/kibana/kibana.yml"
-cp "$KIBANA_CONFIG" "${KIBANA_CONFIG}.bak"
-
-# Tạo encryption keys
-ENC_KEY1=$(openssl rand -hex 32)
-ENC_KEY2=$(openssl rand -hex 32)
-ENC_KEY3=$(openssl rand -hex 32)
-
-cat > "$KIBANA_CONFIG" <<EOF
-# ===================== Kibana - PRODUCTION =====================
-
-server.port: ${KIBANA_PORT}
-server.host: "0.0.0.0"
-server.name: "kibana-production"
-
-# ---- HTTPS cho Kibana UI ----
-server.ssl.enabled: true
-server.ssl.certificate: /etc/kibana/certs/kibana.crt
-server.ssl.key: /etc/kibana/certs/kibana.key
-
-# ---- Kết nối Elasticsearch ----
-elasticsearch.hosts: ["https://localhost:${ES_PORT}"]
-elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/ca.crt"]
-elasticsearch.ssl.verificationMode: certificate
-
-# ---- Auth ----
+# Memory limit
+mkdir -p /etc/systemd/system/kibana.service.d
+cat > /etc/systemd/system/kibana.service.d/override.conf <<EOF
+[Service]
+Environment="NODE_OPTIONS=--max-old-space-size=512"
+TimeoutStartSec=900
 EOF
 
-if [ -n "$KIBANA_TOKEN" ]; then
-cat >> "$KIBANA_CONFIG" <<EOF
-elasticsearch.serviceAccountToken: "${KIBANA_TOKEN}"
-EOF
-else
-cat >> "$KIBANA_CONFIG" <<EOF
+cat > /etc/kibana/kibana.yml <<EOF
+server.port: 5601
+server.host: "127.0.0.1"
+server.name: "${DOMAIN}"
+elasticsearch.hosts: ["http://127.0.0.1:9200"]
 elasticsearch.username: "kibana_system"
-elasticsearch.password: "${ES_PASSWORD}"
-EOF
-fi
-
-cat >> "$KIBANA_CONFIG" <<EOF
-
-# ---- Encryption keys (bắt buộc cho production) ----
-xpack.security.encryptionKey: "${ENC_KEY1}"
-xpack.encryptedSavedObjects.encryptionKey: "${ENC_KEY2}"
-xpack.reporting.encryptionKey: "${ENC_KEY3}"
-
-# ---- Session ----
-xpack.security.session.idleTimeout: "1h"
-xpack.security.session.lifespan: "8h"
-
-# ---- Monitoring ----
-monitoring.ui.ccs.enabled: false
-telemetry.enabled: false
-
-# ---- Logging ----
-logging.appenders.file.type: file
-logging.appenders.file.fileName: /var/log/kibana/kibana.log
-logging.appenders.file.layout.type: json
-logging.root.appenders: [default, file]
-logging.root.level: warn
+elasticsearch.password: "${KIBANA_PASS}"
 EOF
 
-log "Cấu hình Kibana xong"
+mkdir -p /var/log/kibana
+chown -R kibana:kibana /var/log/kibana
 
-# ============================================================
-# BƯỚC 11: Khởi động Kibana
-# ============================================================
-header "Bước 11: Khởi động Kibana"
+log "Starting Kibana (2-3 minutes)..."
 systemctl daemon-reload
-systemctl enable kibana
+systemctl enable kibana >/dev/null 2>&1
 systemctl start kibana
-log "Kibana đã khởi động"
 
-# ============================================================
-# BƯỚC 12: Firewall
-# ============================================================
-header "Bước 12: Cấu hình Firewall (UFW)"
-ufw --force enable > /dev/null 2>&1 || true
-ufw allow ssh
-ufw allow ${KIBANA_PORT}/tcp comment "Kibana HTTPS"
-# ES port chỉ mở local (không expose ra ngoài cho production)
-# Nếu cần truy cập ES từ ngoài: ufw allow ${ES_PORT}/tcp
-ufw reload > /dev/null 2>&1 || true
-log "Firewall: SSH + Kibana(:${KIBANA_PORT}) mở. ES(:${ES_PORT}) chỉ localhost"
+log "Waiting for Kibana..."
+for i in {1..120}; do
+    if curl -s http://127.0.0.1:5601/api/status >/dev/null 2>&1; then
+        success "Kibana running"
+        break
+    fi
+    [ $((i % 10)) -eq 0 ] && echo -n " ${i}s"
+    sleep 1
+done
+echo ""
+echo ""
 
-# ============================================================
-# BƯỚC 13: Logrotate
-# ============================================================
-cat > /etc/logrotate.d/elasticsearch <<EOF
-/var/log/elasticsearch/*.log {
-  daily
-  rotate 14
-  compress
-  delaycompress
-  missingok
-  notifempty
-  sharedscripts
-  postrotate
-    systemctl reload elasticsearch > /dev/null 2>&1 || true
-  endscript
+#####################################
+# 8. NGINX WITH ES API PROXY
+#####################################
+echo "━━━ [8/8] Nginx ━━━"
+apt-get install -y -qq nginx
+
+cat > /etc/nginx/sites-available/kibana <<'NGINXCONF'
+upstream kibana {
+    server 127.0.0.1:5601;
 }
-EOF
 
-cat > /etc/logrotate.d/kibana <<EOF
-/var/log/kibana/*.log {
-  daily
-  rotate 14
-  compress
-  delaycompress
-  missingok
-  notifempty
+upstream elasticsearch {
+    server 127.0.0.1:9200;
 }
-EOF
-log "Logrotate đã cấu hình (giữ 14 ngày)"
 
-# ============================================================
-# LƯU THÔNG TIN ĐĂNG NHẬP
-# ============================================================
-CRED_FILE="/root/.elk-credentials"
-PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+server {
+    listen 443 ssl http2;
+    server_name DOMAIN_PLACEHOLDER;
+    
+    ssl_certificate /etc/ssl/cloudflare/fullchain.pem;
+    ssl_certificate_key /etc/ssl/cloudflare/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    
+    # Increase body size for bulk indexing
+    client_max_body_size 100M;
+    
+    # Elasticsearch API routes (must come BEFORE location /)
+    location ~ ^/(woo_products|products|_bulk|_search|_doc|_cluster|_cat|_count|_mapping|_index|_settings|_alias) {
+        proxy_pass http://elasticsearch;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        
+        # Timeouts for long-running queries
+        proxy_connect_timeout 90s;
+        proxy_send_timeout 90s;
+        proxy_read_timeout 90s;
+    }
+    
+    # Kibana UI (catch-all, must come AFTER ES routes)
+    location / {
+        proxy_pass http://kibana;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
 
-cat > "$CRED_FILE" <<EOF
-# ============================================================
-#  ELK PRODUCTION — THÔNG TIN ĐĂNG NHẬP
-#  Tạo lúc: $(date)
-# ============================================================
+server {
+    listen 80;
+    server_name DOMAIN_PLACEHOLDER;
+    return 301 https://$server_name$request_uri;
+}
+NGINXCONF
 
-Elasticsearch URL : https://${PUBLIC_IP}:${ES_PORT}
-Kibana URL        : https://${PUBLIC_IP}:${KIBANA_PORT}
+sed -i "s/DOMAIN_PLACEHOLDER/${DOMAIN}/g" /etc/nginx/sites-available/kibana
 
-[Tài khoản Elasticsearch]
-Username : elastic
-Password : ${ES_PASSWORD}
+ln -sf /etc/nginx/sites-available/kibana /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
 
-[Kibana Service Token]
-Token    : ${KIBANA_TOKEN}
+nginx -t
+systemctl enable nginx >/dev/null 2>&1
+systemctl restart nginx
 
-[Certificates]
-CA cert  : /etc/elasticsearch/certs/ca.crt
-ES cert  : /etc/elasticsearch/certs/elastic-certificates.p12
-Kibana   : /etc/kibana/certs/
-
-[Encryption Keys - Kibana]
-Key1: ${ENC_KEY1}
-Key2: ${ENC_KEY2}
-Key3: ${ENC_KEY3}
-
-QUAN TRỌNG: Sao lưu file này và xóa sau khi đã lưu trữ an toàn!
-EOF
-chmod 600 "$CRED_FILE"
-
-# ============================================================
-# KẾT QUẢ
-# ============================================================
+success "Nginx configured"
 echo ""
-echo -e "${GREEN}${BOLD}============================================================${NC}"
-echo -e "${GREEN}${BOLD}   CÀI ĐẶT HOÀN TẤT — PRODUCTION READY!${NC}"
-echo -e "${GREEN}${BOLD}============================================================${NC}"
+
+#####################################
+# DONE
+#####################################
+echo "╔════════════════════════════════════════════════════════════════╗"
+echo "║                                                                ║"
+echo "║                  ✅ INSTALLATION COMPLETE! 🎉                 ║"
+echo "║                                                                ║"
+echo "╚════════════════════════════════════════════════════════════════╝"
 echo ""
-echo -e "  ${CYAN}Kibana (HTTPS):${NC}        https://${PUBLIC_IP}:${KIBANA_PORT}"
-echo -e "  ${CYAN}Elasticsearch (HTTPS):${NC} https://${PUBLIC_IP}:${ES_PORT}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🌐 ACCESS"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo -e "  ${CYAN}Username:${NC}  elastic"
-echo -e "  ${CYAN}Password:${NC}  ${BOLD}${ES_PASSWORD}${NC}"
+echo "   Kibana UI: ${YELLOW}https://${DOMAIN}${NC}"
+echo "   ES API:    ${YELLOW}https://${DOMAIN}/woo_products/_search${NC}"
 echo ""
-echo -e "  ${YELLOW}⚠  Thông tin đăng nhập đã lưu tại: ${BOLD}${CRED_FILE}${NC}"
+echo "   Username: ${GREEN}elastic${NC}"
+echo "   Password: ${GREEN}${ELASTIC_PASS}${NC}"
 echo ""
-echo -e "  ${CYAN}Lệnh hữu ích:${NC}"
-echo -e "  systemctl status elasticsearch kibana"
-echo -e "  journalctl -u elasticsearch -f"
-echo -e "  journalctl -u kibana -f"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🔑 CREATE API KEY"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo -e "  ${YELLOW}Ghi chú:${NC}"
-echo -e "  - Kibana dùng HTTPS, trình duyệt có thể cảnh báo self-signed cert → chọn 'Advanced > Proceed'"
-echo -e "  - Kibana mất 1-2 phút để load lần đầu"
-echo -e "  - ES port 9200 chỉ mở localhost. Mở ra ngoài nếu cần: ufw allow 9200/tcp"
-echo -e "  - Đổi mật khẩu sau lần đăng nhập đầu tiên!"
+echo "   Login to Kibana → Management → API Keys → Create"
+echo ""
+echo "   Or use Dev Tools:"
+echo ""
+echo "   POST /_security/api_key"
+echo "   {"
+echo '     "name": "wordpress_indexing",'
+echo '     "role_descriptors": {'
+echo '       "indexing_role": {'
+echo '         "cluster": ["monitor"],'
+echo '         "indices": [{'
+echo '           "names": ["woo_products*"],'
+echo '           "privileges": ["all"]'
+echo "         }]"
+echo "       }"
+echo "     },"
+echo '     "expiration": "365d"'
+echo "   }"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📝 USAGE EXAMPLES"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "   # Index document"
+echo "   curl -X POST 'https://${DOMAIN}/woo_products/_doc' \\"
+echo "     -H 'Authorization: ApiKey YOUR_API_KEY' \\"
+echo "     -H 'Content-Type: application/json' \\"
+echo "     -d '{\"name\":\"Product\",\"price\":99}'"
+echo ""
+echo "   # Search"
+echo "   curl -X GET 'https://${DOMAIN}/woo_products/_search' \\"
+echo "     -H 'Authorization: ApiKey YOUR_API_KEY'"
+echo ""
+echo "   # PHP Code:"
+echo "   \$client = ClientBuilder::create()"
+echo "       ->setHosts(['https://${DOMAIN}'])"
+echo "       ->setApiKey('YOUR_API_KEY')"
+echo "       ->setSSLVerification(false)"
+echo "       ->build();"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📊 SERVICES"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+for svc in elasticsearch kibana nginx; do
+    if systemctl is-active --quiet $svc; then
+        echo "   ${GREEN}✓${NC} $svc"
+    else
+        echo "   ${RED}✗${NC} $svc"
+    fi
+done
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "💾 MEMORY"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+free -h | grep -E "Mem:|Swap:"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "🎉 Ready! Access: https://${DOMAIN}"
 echo ""
